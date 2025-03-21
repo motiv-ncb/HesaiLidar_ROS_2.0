@@ -14,6 +14,8 @@ configure_file(
 )
 # add_definitions(-DJT128_256)
 
+option(CUDA_ENABLED "Enable CUDA" OFF)
+
 #=======================================
 # Custom Point Type (XYZI, XYZIRT)
 #=======================================
@@ -39,10 +41,10 @@ if (CMAKE_BUILD_TYPE STREQUAL "")
   add_definitions(-O3)
 endif()
 
-if($ENV{ROS_DISTRO} STREQUAL "humble")  # the ros2 humble requires c++17
-add_definitions(-std=c++17)
+if($ENV{ROS_DISTRO} STREQUAL "humble" OR $ENV{ROS_DISTRO} STREQUAL "jazzy")  # the ros2 humble requires c++17
+  set(CMAKE_CXX_STANDARD 17)
 else()
-add_definitions(-std=c++14)
+  set(CMAKE_CXX_STANDARD 14)
 endif()
 
 add_compile_options(-Wall)
@@ -156,7 +158,10 @@ link_directories(${Boost_LIBRARY_DIRS})
 # if install different cuda version, set the cuda path, like cuda-11.4
 # set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda-11.4/)
 # find_package(CUDA REQUIRED)
-find_package(CUDA )
+
+if (CUDA_ENABLED)
+  find_package(CUDA)
+endif()
 
 if(CUDA_FOUND)
   
