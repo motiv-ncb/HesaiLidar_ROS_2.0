@@ -5,7 +5,7 @@
   correct_arrays(), operation by operation, so the driver and the converter give the same cloud to the float32 bit
   (checked on 742 M points). v4 has the parameters of v3 computed in two steps (11-19, user's choice: less work per
   point). Per point of ring r (0 = top):
-    1. direction of the beam: firing rotation about z by the per-ring angle (cos / sin given in the file), and the
+    1. direction of the beam: firing rotation about z by the per-ring angle (cos / sin evaluated at load), and the
        global elevation offset as a rotation of (h, z) in the vertical plane of the point (cos / sin of the offset
        evaluated once at load: no atan2 / cos / sin per point);
     2. optical centre and near field together, in the frame of the point, u_h = (x, y) / h outwards and
@@ -20,10 +20,16 @@
   the origin) the points differ by 0.027 mm, almost all vertical (the optical centre sees the corrected elevation:
   31.5 mm * sin 0.05 deg).
 
-  The numbers come from a YAML file written by xt32_driver_model.py from convert_rings.unit_params(); the SDK must
-  decode raw (no firetimes file, distance_correction_flag false, xt_spot_correction false, no transform), which
-  the driver checks at start-up. Built without -ffast-math and without FMA (no -march), as the rest of the driver,
-  so the arithmetic is the same IEEE double arithmetic numpy does.
+  The file (driver/xt32_model_path) holds the calibration as in the scanner profile, block lidar_sensor_model
+  (written by xt32_driver_model.py from convert_rings.py; motiv's lidar.launch.py copies it once to
+  config/lidar/xt32_model_<serial>.yaml):
+    model_version, lidar_hz, firing_scale, firing_da_rad ([] or 32 values), optical_centre_mm [left, forward],
+    near_field_r_m, near_field_a_mm, near_field_b_mm, elev_offset_deg (and serial_number).
+  The derived numbers are computed at load with the same operations as convert_rings.unit_params(), in the same
+  order (firing angle -2 pi hz 1.512e-6 scale (r - 15.5) - da, mm * 1e-3, deg * (pi / 180), libm cos / sin), so
+  they are the converter's doubles to the bit. The SDK must decode raw (no firetimes file, distance_correction_flag
+  false, xt_spot_correction false, no transform), which the driver checks at start-up. Built without -ffast-math and
+  without FMA (no -march), as the rest of the driver, so the arithmetic is the same IEEE double arithmetic numpy does.
 ************************************************************************************************/
 #ifndef HESAI_ROS_XT32_MODEL_HPP_
 #define HESAI_ROS_XT32_MODEL_HPP_
@@ -31,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <yaml-cpp/yaml.h>
@@ -42,30 +49,60 @@ public:
   bool Load(const std::string& path, std::string& msg)
   {
     enabled_ = false;
+    double hz = 0.0, scale = 0.0, elev_deg = 0.0;
+    std::vector<double> da, oc_mm, a_mm, b_mm;
     try {
       const YAML::Node m = YAML::LoadFile(path);
-      cos_ = m["firing_cos"].as<std::vector<double>>();
-      sin_ = m["firing_sin"].as<std::vector<double>>();
-      left_ = m["optical_centre_left_m"].as<double>();
-      fwd_ = m["optical_centre_forward_m"].as<double>();
-      r_ = m["near_field_r_m"].as<std::vector<double>>();
-      b_ = m["near_field_b_m"].as<std::vector<double>>();
-      a_ = m["near_field_a_m"].as<std::vector<double>>();
-      elev_ = m["elev_offset_rad"].as<double>();
-      model_ = m["model"].as<std::string>();
+      version_ = m["model_version"].as<std::string>();
       serial_ = m["serial_number"].as<std::string>();
+      hz = m["lidar_hz"].as<double>();
+      scale = m["firing_scale"].as<double>();
+      da = m["firing_da_rad"].as<std::vector<double>>();
+      oc_mm = m["optical_centre_mm"].as<std::vector<double>>();
+      r_ = m["near_field_r_m"].as<std::vector<double>>();
+      a_mm = m["near_field_a_mm"].as<std::vector<double>>();
+      b_mm = m["near_field_b_mm"].as<std::vector<double>>();
+      elev_deg = m["elev_offset_deg"].as<double>();
     } catch (const std::exception& e) {
       msg = "xt32 model " + path + ": " + e.what();
       return false;
     }
-    if (cos_.size() != 32 || sin_.size() != 32) {
-      msg = "xt32 model " + path + ": firing_cos and firing_sin need 32 values";
+    if (!da.empty() && da.size() != 32) {
+      msg = "xt32 model " + path + ": firing_da_rad needs 0 or 32 values";
       return false;
     }
-    if (r_.size() != b_.size() || r_.size() != a_.size() || r_.size() == 1) {
-      msg = "xt32 model " + path + ": near_field_r_m, _b_m and _a_m need the same length (0, or 2 or more)";
+    if (oc_mm.size() != 2) {
+      msg = "xt32 model " + path + ": optical_centre_mm needs [left, forward]";
       return false;
     }
+    if (r_.size() != b_mm.size() || r_.size() != a_mm.size() || r_.size() == 1) {
+      msg = "xt32 model " + path + ": near_field_r_m, _a_mm and _b_mm need the same length (0, or 2 or more)";
+      return false;
+    }
+    // convert_rings.unit_params(), same operations in the same order
+    const double base = -2.0 * M_PI * hz * 1.512e-6 * scale;
+    cos_.assign(32, 1.0);
+    sin_.assign(32, 0.0);
+    for (int r = 0; r < 32; ++r) {
+      double angle = base * (r - 15.5);
+      if (!da.empty()) angle = angle - da[r];
+      cos_[r] = std::cos(angle);
+      sin_[r] = std::sin(angle);
+    }
+    left_ = oc_mm[0] * 1e-3;
+    fwd_ = oc_mm[1] * 1e-3;
+    a_.resize(a_mm.size());
+    b_.resize(b_mm.size());
+    for (size_t j = 0; j < r_.size(); ++j) {
+      a_[j] = 1e-3 * a_mm[j];
+      b_[j] = 1e-3 * b_mm[j];
+    }
+    elev_ = elev_deg * (M_PI / 180.0);
+    std::ostringstream what;
+    what << version_ << ", firing scale " << scale << (da.empty() ? "" : " + da") << ", optical centre " << oc_mm[0]
+         << " / " << oc_mm[1] << " mm, near field " << r_.size() << " nodes, elevation offset " << elev_deg
+         << " deg, " << hz << " Hz";
+    model_ = what.str();
     for (size_t j = 1; j < r_.size(); ++j) {
       if (!(r_[j] > r_[j - 1])) {
         msg = "xt32 model " + path + ": near_field_r_m must be strictly ascending";
@@ -184,7 +221,7 @@ private:
   bool enabled_ = false, use_nf_ = false, has_b_ = false;
   std::vector<double> cos_, sin_, r_, b_, a_, slope_a_, slope_b_;
   double left_ = 0.0, fwd_ = 0.0, elev_ = 0.0, cos_e_ = 1.0, sin_e_ = 0.0, r_zero_ = 0.0;
-  std::string model_, serial_;
+  std::string model_, serial_, version_;
 };
 
 #endif  // HESAI_ROS_XT32_MODEL_HPP_
