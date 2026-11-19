@@ -47,6 +47,7 @@
 #include <functional>
 #include <boost/thread.hpp>
 #include "source_drive_common.hpp"
+#include "utility/xt32_model.hpp"
 
 class SourceDriver
 {
@@ -104,6 +105,8 @@ protected:
   // Convert Angular Velocity from degree/s to radian/s
   // double From_degs_To_rads(double degree);
   std::string frame_id_;
+  // Per-unit XT-32 sensor model (driver/xt32_model_path, = convert_rings.py); disabled when the key is empty or absent
+  Xt32Model xt32_model_;
 
   rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr crt_sub_;
   rclcpp::Subscription<hesai_ros_driver::msg::UdpFrame>::SharedPtr pkt_sub_;
@@ -127,6 +130,32 @@ inline void SourceDriver::Init(const YAML::Node& config)
   frame_id_ = driver_param.input_param.frame_id;
 
   node_ptr_.reset(new rclcpp::Node("hesai_ros_driver_node"));
+  std::string near_field_path, xt32_model_path;
+  YamlRead<std::string>(config["driver"], "near_field_path", near_field_path, "");
+  YamlRead<std::string>(config["driver"], "xt32_model_path", xt32_model_path, "");
+  if (!near_field_path.empty()) {
+    RCLCPP_FATAL(node_ptr_->get_logger(), "near_field_path was replaced by xt32_model_path (whole model, xt32_driver_model.py)");
+    exit(-1);
+  }
+  if (!xt32_model_path.empty()) {
+    // the model is applied to the raw SDK points: any SDK correction on top would be applied twice
+    const auto& fire = driver_param.input_param.firetimes_path;
+    const char* clash = nullptr;
+    if (driver_param.decoder_param.transform_param.use_flag) clash = "transform_flag: false";
+    else if (driver_param.decoder_param.distance_correction_flag) clash = "distance_correction_flag: false";
+    else if (driver_param.decoder_param.xt_spot_correction) clash = "xt_spot_correction: false";
+    else if (!fire.empty() && std::ifstream(fire).good()) clash = "firetimes_path: \"\"";
+    if (clash) {
+      RCLCPP_FATAL(node_ptr_->get_logger(), "xt32_model_path needs the SDK to decode raw: set %s", clash);
+      exit(-1);
+    }
+    std::string msg;
+    if (!xt32_model_.Load(xt32_model_path, msg)) {
+      RCLCPP_FATAL(node_ptr_->get_logger(), "%s", msg.c_str());
+      exit(-1);
+    }
+    RCLCPP_INFO(node_ptr_->get_logger(), "%s", msg.c_str());
+  }
   if (driver_param.input_param.send_point_cloud_ros) {
     pub_ = node_ptr_->create_publisher<sensor_msgs::msg::PointCloud2>(driver_param.input_param.ros_send_point_topic, 10);
   }
@@ -292,6 +321,7 @@ inline sensor_msgs::msg::PointCloud2 SourceDriver::ToRosMsg(const LidarDecodedFr
   for (size_t i = 0; i < points_number; i++)
   {
     LidarPointXYZIRT point = pPoints[i];
+    if (xt32_model_.Enabled()) xt32_model_.Apply(point.x, point.y, point.z, point.ring);
     *iter_x_ = point.x;
     *iter_y_ = point.y;
     *iter_z_ = point.z;
